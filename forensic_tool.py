@@ -23,7 +23,7 @@ Run:
 # ─── Standard Library ─────────────────────────────────────────────────────────
 import os
 import re
-import sysgit
+import sys
 import json
 import shutil
 import hashlib
@@ -582,8 +582,8 @@ class KeywordSearchEngine:
 
     @property
     def available(self):
-        return (self.ocr_available or self.pdf_available
-                or self.docx_available or self.pptx_available)
+        # Always available — plain .txt/.csv/.html etc need no library at all
+        return True
 
     # ── Lazy load EasyOCR (heavy — ~200 MB model) ─────────────────
     def load_ocr(self, log_fn=None):
@@ -595,8 +595,8 @@ class KeywordSearchEngine:
             if log_fn:
                 log_fn("  Loading EasyOCR model (first run ~200 MB)…", "info")
             self._ocr_reader = _easyocr.Reader(
-                ['en'],          # English; add 'ur' for Urdu if needed
-                gpu=False,       # set True if CUDA available
+                ['en'],
+                gpu=False,
                 verbose=False,
             )
             if log_fn:
@@ -716,12 +716,19 @@ class KeywordSearchEngine:
     def scan_folder(self, folder: str, keywords: List[str],
                     do_images: bool = True, do_docs: bool = True,
                     case_sensitive: bool = False,
-                    progress_cb=None) -> List[Dict]:
+                    progress_cb=None,
+                    log_fn=None) -> List[Dict]:
         """
         Walk folder, extract text, search keywords.
         progress_cb(done, total, filepath) called for UI updates.
+        log_fn(msg, tag) called for live log output.
         Returns list of result dicts.
         """
+        def _log(msg, tag="info"):
+            logger.info(msg)
+            if log_fn:
+                log_fn(f"  {msg}", tag)
+
         folder_path = Path(folder)
         all_files   = []
 
@@ -734,37 +741,73 @@ class KeywordSearchEngine:
                 all_files += list(folder_path.rglob(f"*{ext}"))
                 all_files += list(folder_path.rglob(f"*{ext.upper()}"))
 
-        # Deduplicate
-        all_files = list({str(f): f for f in all_files}.values())
+        # Deduplicate preserving order
+        seen_paths = set()
+        deduped = []
+        for f in all_files:
+            key = str(f).lower()   # case-insensitive dedup on Windows
+            if key not in seen_paths:
+                seen_paths.add(key)
+                deduped.append(f)
+        all_files = deduped
         total     = len(all_files)
-        results   = []
+
+        _log(f"Keyword scan — found {total} file(s) to search "
+             f"(images: {do_images}, docs: {do_docs})", "info")
+
+        if total == 0:
+            _log("No files found in folder for keyword search.", "error")
+            return []
+
+        results = []
 
         for i, fp in enumerate(all_files):
             if progress_cb:
                 progress_cb(i + 1, total, fp.name)
 
-            text = self.extract_text(str(fp))
-            if not text:
+            ext = fp.suffix.lower()
+
+            # Skip images if OCR not available
+            if ext in IMG_EXTENSIONS and not self.ocr_available:
+                continue
+
+            try:
+                text = self.extract_text(str(fp))
+            except Exception as e:
+                _log(f"Extract error: {fp.name} — {e}", "error")
+                continue
+
+            if not text or not text.strip():
+                logger.debug(f"No text extracted from: {fp.name}")
                 continue
 
             hits = self.search_keywords(text, keywords, case_sensitive)
             if hits:
-                ext    = fp.suffix.lower()
-                ftype  = "image" if ext in IMG_EXTENSIONS else "document"
-                results.append({
-                    "filepath":   str(fp),
-                    "filename":   fp.name,
-                    "filetype":   ftype,
-                    "extension":  ext,
-                    "keywords_found": hits,       # {kw: [sentences]}
-                    "keyword_count":  len(hits),
-                    "total_hits": sum(len(v) for v in hits.values()),
-                    "metadata":   ForensicEngine.extract_metadata(str(fp)),
-                    "hashes":     ForensicEngine.compute_hashes(str(fp)),
-                })
-                logger.info(f"KEYWORD MATCH: {fp.name} — "
-                            f"keywords={list(hits.keys())}")
+                ftype = "image" if ext in IMG_EXTENSIONS else "document"
+                try:
+                    metadata = ForensicEngine.extract_metadata(str(fp))
+                    hashes   = ForensicEngine.compute_hashes(str(fp))
+                except Exception:
+                    metadata = {"filename": fp.name, "folder": str(fp.parent),
+                                "filepath": str(fp)}
+                    hashes   = {}
 
+                results.append({
+                    "filepath":       str(fp),
+                    "filename":       fp.name,
+                    "filetype":       ftype,
+                    "extension":      ext,
+                    "keywords_found": hits,
+                    "keyword_count":  len(hits),
+                    "total_hits":     sum(len(v) for v in hits.values()),
+                    "metadata":       metadata,
+                    "hashes":         hashes,
+                })
+                kw_list = ", ".join(hits.keys())
+                _log(f"✔ KEYWORD MATCH  [{kw_list}]  →  {fp.name}", "match")
+
+        _log(f"Keyword scan done — {len(results)} match(es) from {total} file(s).",
+             "match" if results else "info")
         return results
 
 
@@ -1486,16 +1529,21 @@ class ForensicApp(tk.Tk):
         # ═══════════════════════════════════════════════════════
         s_kw = section("🔤", "Keyword Search")
 
-        # Status line
-        kw_ok = self.kw_eng.ocr_available
-        status_line(s_kw, "EasyOCR  (image text)", kw_ok,
-                    "pip install easyocr")
-        status_line(s_kw, "pdfplumber  (PDF text)", self.kw_eng.pdf_available,
+        # Always-available note
+        tk.Label(s_kw,
+                 text="✔  TXT / CSV / HTML — always available (no install needed)",
+                 font=("Segoe UI", 8),
+                 bg=C["bg3"], fg=C["success"]).pack(anchor="w", pady=(4, 0))
+
+        # Optional library status
+        status_line(s_kw, "pdfplumber  (PDF files)", self.kw_eng.pdf_available,
                     "pip install pdfplumber")
-        status_line(s_kw, "python-docx  (Word)", self.kw_eng.docx_available,
+        status_line(s_kw, "python-docx  (Word files)", self.kw_eng.docx_available,
                     "pip install python-docx")
         status_line(s_kw, "python-pptx  (PowerPoint)", self.kw_eng.pptx_available,
                     "pip install python-pptx")
+        status_line(s_kw, "EasyOCR  (text inside images)", self.kw_eng.ocr_available,
+                    "pip install easyocr")
 
         tk.Frame(s_kw, bg=C["border"], height=1).pack(fill="x", pady=(8, 4))
 
@@ -2027,42 +2075,95 @@ class ForensicApp(tk.Tk):
             w.destroy()
         self._thumb_refs.clear()
 
-        if not self.matched_results:
+        # Combine image/face/nsfw matches + keyword matches, deduplicated
+        seen      = set()
+        combined  = []
+        for r in self.matched_results:
+            if r["filepath"] not in seen:
+                seen.add(r["filepath"])
+                combined.append(r)
+        for r in self.keyword_results:
+            if r["filepath"] not in seen:
+                seen.add(r["filepath"])
+                combined.append(r)
+
+        if not combined:
             self._show_placeholder("No matches found. Run a scan first.")
             return
 
+        # File-type icon map for documents
+        DOC_ICONS = {
+            ".pdf":  ("📄", "#e06c75"),   # red
+            ".docx": ("📝", "#61afef"),   # blue
+            ".doc":  ("📝", "#61afef"),
+            ".pptx": ("📊", "#e5c07b"),   # amber
+            ".ppt":  ("📊", "#e5c07b"),
+            ".txt":  ("📃", "#98c379"),   # green
+            ".csv":  ("📋", "#56b6c2"),   # teal
+        }
+        IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp",
+                    ".tiff", ".tif", ".webp", ".gif"}
+
         COLS = 5
-        for i, r in enumerate(self.matched_results):
-            row = i // COLS
-            col = i % COLS
+        for i, r in enumerate(combined):
+            row_idx = i // COLS
+            col_idx = i % COLS
+            ext     = Path(r["filepath"]).suffix.lower()
+            is_img  = ext in IMG_EXTS
 
             card = tk.Frame(self.grid_inner, bg=C["bg3"],
-                            padx=0, pady=0, cursor="hand2")
-            card.grid(row=row, column=col, padx=6, pady=6, sticky="nsew")
-            # Cyan top border — only accent use on cards
+                            cursor="hand2")
+            card.grid(row=row_idx, column=col_idx,
+                      padx=6, pady=6, sticky="nsew")
             tk.Frame(card, bg=C["accent"], height=2).pack(fill="x")
 
-            # Thumbnail
-            thumb = ForensicEngine.make_thumbnail(r["filepath"], (140, 105))
-            if thumb:
-                self._thumb_refs.append(thumb)
-                tk.Label(card, image=thumb, bg=C["bg3"]).pack(pady=(6, 0))
+            # ── Preview area ──────────────────────────────────────
+            if is_img:
+                thumb = ForensicEngine.make_thumbnail(
+                    r["filepath"], (140, 105))
+                if thumb:
+                    self._thumb_refs.append(thumb)
+                    tk.Label(card, image=thumb,
+                             bg=C["bg3"]).pack(pady=(6, 0))
+                else:
+                    tk.Label(card, text="🖼\nNo Preview",
+                             font=("Segoe UI", 10),
+                             bg=C["bg4"], fg=C["text3"],
+                             width=18, height=5,
+                             justify="center").pack(pady=(6, 0))
             else:
-                tk.Label(card, text="No preview",
-                         font=("Segoe UI", 8),
-                         bg=C["bg4"], fg=C["text3"],
-                         width=18, height=6).pack(pady=(6, 0))
+                # Document — show big icon + extension badge
+                icon_char, icon_col = DOC_ICONS.get(
+                    ext, ("📄", C["text2"]))
+                doc_frame = tk.Frame(card, bg=C["bg4"],
+                                     width=140, height=105)
+                doc_frame.pack(pady=(6, 0))
+                doc_frame.pack_propagate(False)
+                tk.Label(doc_frame, text=icon_char,
+                         font=("Segoe UI", 32),
+                         bg=C["bg4"]).place(relx=0.5, rely=0.38,
+                                            anchor="center")
+                tk.Label(doc_frame,
+                         text=ext.upper().strip("."),
+                         font=("Segoe UI", 8, "bold"),
+                         bg=icon_col, fg="white",
+                         padx=6, pady=2).place(relx=0.5, rely=0.78,
+                                               anchor="center")
 
-            # Filename — white primary text
-            name = Path(r["filepath"]).name[:24]
-            tk.Label(card, text=name,
+            # ── Filename ──────────────────────────────────────────
+            name = Path(r["filepath"]).name
+            # Wrap long names at 20 chars per line
+            display_name = name if len(name) <= 22 else name[:20] + "…"
+            tk.Label(card, text=display_name,
                      font=("Segoe UI", 8, "bold"),
                      bg=C["bg3"], fg=C["text"],
-                     wraplength=155).pack(pady=(4, 2))
+                     wraplength=155,
+                     justify="center").pack(pady=(4, 2))
 
-            # Detection tags — semantic colors
+            # ── Detection tags ────────────────────────────────────
             tag_row = tk.Frame(card, bg=C["bg3"])
             tag_row.pack(pady=(0, 2))
+
             if r.get("matched_face"):
                 tk.Label(tag_row, text=" FACE ",
                          font=("Segoe UI", 7, "bold"),
@@ -2080,16 +2181,34 @@ class ForensicApp(tk.Tk):
                          font=("Segoe UI", 7, "bold"),
                          bg=C["kiss_col"], fg="white",
                          padx=3).pack(side="left", padx=1)
+            if r.get("keywords_found"):
+                kws = ", ".join(list(r["keywords_found"].keys())[:2])
+                tk.Label(tag_row, text=f" {kws} ",
+                         font=("Segoe UI", 7, "bold"),
+                         bg=C["accent"], fg=C["header"],
+                         padx=3).pack(side="left", padx=1)
 
-            # MD5 hash — dim monospace
-            md5 = r.get("hashes", {}).get("md5", "")[:14]
-            tk.Label(card, text=f"{md5}..",
+            # ── MD5 or keyword count ──────────────────────────────
+            if is_img:
+                md5 = r.get("hashes", {}).get("md5", "")[:14]
+                info_text = f"{md5}.." if md5 else ""
+            else:
+                kc = r.get("keyword_count", 0)
+                info_text = f"{kc} keyword match{'es' if kc != 1 else ''}"
+
+            tk.Label(card, text=info_text,
                      font=("Courier New", 6),
                      bg=C["bg3"], fg=C["text3"]).pack(pady=(0, 6))
 
-            card.bind("<Button-1>", lambda e, res=r: self._show_metadata(res))
+            card.bind("<Button-1>",
+                      lambda e, res=r: self._show_metadata(res))
             for child in card.winfo_children():
-                child.bind("<Button-1>", lambda e, res=r: self._show_metadata(res))
+                child.bind("<Button-1>",
+                           lambda e, res=r: self._show_metadata(res))
+
+        # Expand columns evenly
+        for c in range(COLS):
+            self.grid_inner.columnconfigure(c, weight=1)
 
         self.notebook.select(0)
 
@@ -2177,7 +2296,7 @@ class ForensicApp(tk.Tk):
         do_face     = self.enable_face.get() and self.face_eng.available
         do_nsfw     = self.enable_nsfw.get() and self.nsfw_eng.available
         do_kissing  = self.enable_kissing.get() and self.kiss_eng.available
-        do_keyword  = self.enable_keyword.get() and self.kw_eng.available
+        do_keyword  = self.enable_keyword.get()   # available is always True now
         keywords_raw = self.keywords_var.get()
         keywords    = [k.strip() for k in keywords_raw.split(",") if k.strip()]
         do_keyword  = do_keyword and bool(keywords)
@@ -2402,12 +2521,13 @@ class ForensicApp(tk.Tk):
                 self._set_progress(pct)
 
             self.keyword_results = self.kw_eng.scan_folder(
-                folder      = folder,
-                keywords    = keywords,
-                do_images   = kw_images,
-                do_docs     = kw_docs,
+                folder         = folder,
+                keywords       = keywords,
+                do_images      = kw_images,
+                do_docs        = kw_docs,
                 case_sensitive = kw_case,
-                progress_cb = _kw_progress,
+                progress_cb    = _kw_progress,
+                log_fn         = self._log,
             )
 
             kw_matched = len(self.keyword_results)
@@ -2458,10 +2578,21 @@ class ForensicApp(tk.Tk):
     #  EVIDENCE MANAGEMENT
     # ──────────────────────────────────────────────────────────────
     def _get_matched_paths(self) -> List[str]:
-        if not self.matched_results:
-            messagebox.showwarning("No Results", "No matched images. Run a scan first.")
+        """Return all matched file paths — both image/face/nsfw matches AND keyword matches."""
+        all_results = self.matched_results + self.keyword_results
+        if not all_results:
+            messagebox.showwarning("No Results",
+                "No matched files found.\nRun a scan with at least one detection enabled.")
             return []
-        return [r["filepath"] for r in self.matched_results]
+        # Deduplicate — same file could appear in both lists
+        seen  = set()
+        paths = []
+        for r in all_results:
+            fp = r["filepath"]
+            if fp not in seen:
+                seen.add(fp)
+                paths.append(fp)
+        return paths
 
     def _copy_files(self):
         paths = self._get_matched_paths()
@@ -2489,33 +2620,49 @@ class ForensicApp(tk.Tk):
     # ──────────────────────────────────────────────────────────────
     def _generate_report(self):
         if not self.report_eng.available:
-            messagebox.showerror("Missing", "reportlab not installed.\nRun: pip install reportlab"); return
-        if not self.matched_results:
-            messagebox.showwarning("No Results", "Run a scan first."); return
+            messagebox.showerror("Missing",
+                "reportlab not installed.\nRun: pip install reportlab")
+            return
+
+        all_results = self.matched_results + self.keyword_results
+        if not all_results:
+            messagebox.showwarning("No Results", "Run a scan first.")
+            return
 
         ts   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         path = filedialog.asksaveasfilename(
-            title="Save Forensic PDF Report",
+            title="Save Report",
             defaultextension=".pdf",
             initialfile=f"FinderTool_Report_{ts}.pdf",
             filetypes=[("PDF Files", "*.pdf")])
         if not path: return
 
-        mode = []
-        if self.enable_face.get(): mode.append("Face Matching")
-        if self.enable_nsfw.get(): mode.append("NSFW Detection")
-        scan_mode = " + ".join(mode) if mode else "General Scan"
+        mode_parts = []
+        if self.enable_face.get():    mode_parts.append("Face Matching")
+        if self.enable_nsfw.get():    mode_parts.append("NSFW Detection")
+        if self.enable_kissing.get(): mode_parts.append("Kissing Detection")
+        if self.enable_keyword.get(): mode_parts.append(
+            f"Keyword Search ({self.keywords_var.get()})")
+        scan_mode = " + ".join(mode_parts) if mode_parts else "General Scan"
 
-        total_scanned = int(self.stat_scanned.cget("text").replace(",", ""))
-        ok = self.report_eng.generate(self.matched_results, path, total_scanned, scan_mode)
+        try:
+            total_scanned = int(
+                self.stat_scanned.cget("text").replace(",", ""))
+        except Exception:
+            total_scanned = len(all_results)
+
+        ok = self.report_eng.generate(
+            all_results, path, total_scanned, scan_mode)
 
         if ok:
-            messagebox.showinfo("Report Generated", f"PDF saved to:\n{path}")
-            self._log(f"  PDF report saved: {path}", "match")
-            if messagebox.askyesno("Open Report", "Open the PDF now?"):
-                os.startfile(path)
+            messagebox.showinfo("Report Saved",
+                f"PDF report saved to:\n{path}")
+            self._log(f"  ✔ PDF report saved: {path}", "match")
         else:
-            messagebox.showerror("Error", "PDF generation failed. Check the log.")
+            messagebox.showerror("Error",
+                "Failed to generate PDF report.\nCheck the log for details.")
+            if ok and messagebox.askyesno("Open Report", "Open the PDF now?"):
+                os.startfile(path)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
