@@ -1299,17 +1299,21 @@ class ForensicApp(tk.Tk):
         if not self.running:
             return
         self.stop_requested = True
-        self.stop_btn.config(
-            text="⏳  Stopping…",
-            state="disabled",
-            bg=C["warning"],
-            fg=C["header"],
-        )
-        self._set_status("Stopping scan…", C["warning"])
+
+        # Restore button immediately — don't wait for thread to finish
+        self.scan_btn.config(
+            text="▶  Start Scan",
+            state="normal",
+            bg=C["accent"])
+        self.stop_btn.pack_forget()
+
+        self._set_status("Stopping scan… finishing current operation",
+                         C["warning"])
         self._log("  ⏹ STOP requested — halting before next file.", "skip")
 
     def _start_scan(self):
         if self.running: return
+        if self.stop_requested: return   # still cleaning up from stop
         if not self._validate_scan(): return
         self.running        = True
         self.stop_requested = False
@@ -1451,6 +1455,11 @@ class ForensicApp(tk.Tk):
         # ── Pre-load CLIP — from local cache ONLY, never download ───
         # Download is handled separately via the Download button in the UI
         if do_kissing:
+            # ── Stop check BEFORE starting CLIP load ─────────────
+            if self.stop_requested:
+                self._finish_scan(start_time, 0)
+                return
+
             if self.kiss_eng._loaded:
                 self._log("  ✔ CLIP already loaded — reusing.\n", "match")
             else:
@@ -1477,6 +1486,12 @@ class ForensicApp(tk.Tk):
                 else:
                     self._log("  Loading from local cache (no download)…", "info")
                     loaded = self.kiss_eng.load(log_fn=self._log)
+
+                    # ── Stop check AFTER load (user may have clicked Stop during load) ──
+                    if self.stop_requested:
+                        self._finish_scan(start_time, 0)
+                        return
+
                     if not loaded:
                         self._log("  ✘ CLIP load failed — skipping kissing detection.", "error")
                         if not self.kiss_eng.available:
@@ -1674,9 +1689,19 @@ class ForensicApp(tk.Tk):
         self.stop_requested = False
 
         def _restore_btns():
-            self.scan_btn.config(
-                text="▶  Start Scan", state="normal", bg=C["accent"])
-            self.stop_btn.pack_forget()   # hide stop button
+            # Only restore if stop button is still visible
+            # (if user clicked Stop, _stop_scan already restored them)
+            try:
+                if self.stop_btn.winfo_ismapped():
+                    self.scan_btn.config(
+                        text="▶  Start Scan", state="normal", bg=C["accent"])
+                    self.stop_btn.pack_forget()
+                elif self.scan_btn.cget("state") == "disabled":
+                    # scan_btn still disabled — restore it
+                    self.scan_btn.config(
+                        text="▶  Start Scan", state="normal", bg=C["accent"])
+            except Exception:
+                pass
 
         self.after(0, _restore_btns)
         self.after(0, self._show_results)
