@@ -388,9 +388,30 @@ class ForensicApp(tk.Tk):
         toggle(s3, "Detect kissing / intimate content", self.enable_kissing)
         slider(s3, "Kissing threshold",
                self.kiss_threshold, 0.10, 0.60, 0.05, "{:.0%}")
-        tk.Label(s3, text="⚠  CLIP downloads ~600 MB model on first use",
-                 font=("Segoe UI", 8),
-                 bg=C["bg3"], fg=C["warning"]).pack(anchor="w", pady=(6, 0))
+
+        # Model download status label — updates dynamically
+        self.clip_status_lbl = tk.Label(
+            s3, text="",
+            font=("Segoe UI", 8),
+            bg=C["bg3"], fg=C["warning"])
+        self.clip_status_lbl.pack(anchor="w", pady=(4, 2))
+
+        # Download button — only shown if transformers/torch are installed
+        if _clip_available:
+            self.clip_dl_btn = tk.Button(
+                s3, text="⬇  Download CLIP Model Now",
+                font=("Segoe UI", 8, "bold"),
+                bg=C["bg5"], fg=C["text"],
+                bd=0, relief="flat",
+                padx=10, pady=7,
+                cursor="hand2",
+                activebackground=C["accent2"],
+                activeforeground="white",
+                command=self._download_clip_model,
+            )
+            self.clip_dl_btn.pack(fill="x", pady=(0, 4))
+            # Immediately check if model is already cached
+            self.after(100, self._check_clip_cached)
 
         # ═══════════════════════════════════════════════════════
         # 04 — KEYWORD SEARCH
@@ -866,6 +887,106 @@ class ForensicApp(tk.Tk):
     # ──────────────────────────────────────────────────────────────
     #  BROWSE HANDLERS
     # ──────────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────
+    #  CLIP MODEL DOWNLOAD
+    # ──────────────────────────────────────────────────────────────
+    def _check_clip_cached(self):
+        """Check if CLIP model is already on disk. Update label accordingly."""
+        if not _clip_available:
+            return
+        try:
+            from huggingface_hub import try_to_load_from_cache
+            # Check for the main model file
+            cached = try_to_load_from_cache(
+                "openai/clip-vit-base-patch32", "model.safetensors")
+            if cached is None:
+                cached = try_to_load_from_cache(
+                    "openai/clip-vit-base-patch32", "pytorch_model.bin")
+
+            if cached:
+                self.clip_status_lbl.config(
+                    text="✔  CLIP model ready (cached locally)",
+                    fg=C["success"])
+                self.clip_dl_btn.config(
+                    text="✔  Model Ready — Re-download",
+                    bg=C["bg4"], fg=C["text2"])
+            else:
+                self.clip_status_lbl.config(
+                    text="⚠  Model not downloaded yet (~600 MB)",
+                    fg=C["warning"])
+                self.clip_dl_btn.config(
+                    text="⬇  Download CLIP Model Now",
+                    bg=C["bg5"], fg=C["text"])
+        except Exception:
+            # huggingface_hub check failed — just show warning
+            self.clip_status_lbl.config(
+                text="⚠  Model will download (~600 MB) on first scan",
+                fg=C["warning"])
+
+    def _download_clip_model(self):
+        """Download CLIP model in background thread — separate from scanning."""
+        if not _clip_available:
+            return
+        if getattr(self, '_clip_downloading', False):
+            messagebox.showinfo("Downloading",
+                "CLIP model download is already in progress.\n"
+                "Check the terminal for progress.")
+            return
+
+        if messagebox.askyesno(
+            "Download CLIP Model",
+            "This will download ~600 MB from HuggingFace.\n\n"
+            "Progress will show in the terminal window.\n"
+            "You can still use the tool while downloading.\n\n"
+            "Start download now?"
+        ):
+            self._clip_downloading = True
+            self.clip_dl_btn.config(
+                text="⏳  Downloading… (see terminal)",
+                state="disabled",
+                bg=C["warning"], fg=C["header"])
+            self.clip_status_lbl.config(
+                text="Downloading ~600 MB — see terminal for progress…",
+                fg=C["warning"])
+
+            def _do_download():
+                try:
+                    self._log("  ── CLIP Model Download ──", "heading")
+                    self._log("  Downloading openai/clip-vit-base-patch32…", "info")
+                    self._log("  Progress shown in terminal. This may take several minutes.", "info")
+                    self.notebook.select(1)  # switch to log tab
+
+                    from transformers import CLIPProcessor, CLIPModel
+                    CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+                    CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+
+                    self._log("  ✔ CLIP model downloaded and cached successfully!", "match")
+                    self.after(0, lambda: self.clip_status_lbl.config(
+                        text="✔  CLIP model ready (cached locally)",
+                        fg=C["success"]))
+                    self.after(0, lambda: self.clip_dl_btn.config(
+                        text="✔  Model Ready — Re-download",
+                        state="normal",
+                        bg=C["bg4"], fg=C["text2"]))
+                    # Pre-load model into memory now
+                    self.after(0, lambda: self._log(
+                        "  Loading model into memory…", "info"))
+                    self.kiss_eng.load(log_fn=self._log)
+
+                except Exception as e:
+                    self._log(f"  ✘ Download failed: {e}", "error")
+                    self.after(0, lambda: self.clip_status_lbl.config(
+                        text=f"✘  Download failed — check internet connection",
+                        fg=C["danger"]))
+                    self.after(0, lambda: self.clip_dl_btn.config(
+                        text="⬇  Retry Download",
+                        state="normal",
+                        bg=C["danger"], fg="white"))
+                finally:
+                    self._clip_downloading = False
+
+            threading.Thread(target=_do_download, daemon=True).start()
+
     def _browse_scan_folder(self):
         path = filedialog.askdirectory(title="Select Image Folder to Scan")
         if path:
@@ -1212,7 +1333,7 @@ class ForensicApp(tk.Tk):
         folder      = self.scan_folder.get()
         do_face     = self.enable_face.get() and self.face_eng.available
         do_nsfw     = self.enable_nsfw.get() and self.nsfw_eng.available
-        do_kissing  = self.enable_kissing.get() and self.kiss_eng.available
+        do_kissing  = self.enable_kissing.get() and _clip_available
         do_keyword  = self.enable_keyword.get()   # available is always True now
         keywords_raw = self.keywords_var.get()
         keywords    = [k.strip() for k in keywords_raw.split(",") if k.strip()]
@@ -1327,16 +1448,42 @@ class ForensicApp(tk.Tk):
         # Pre-convert sample encoding once
         sample_enc_arr = sample_enc
 
-        # ── Pre-load CLIP once before loop (not per-image) ─────────
+        # ── Pre-load CLIP — from local cache ONLY, never download ───
+        # Download is handled separately via the Download button in the UI
         if do_kissing:
-            self._set_status("Loading CLIP model for kissing detection…")
-            self._log("  Loading CLIP model (text features pre-caching)…", "info")
-            self.kiss_eng.load()
-            if not self.kiss_eng._loaded:
-                self._log("  ✘ CLIP failed to load — kissing detection disabled.", "error")
-                do_kissing = False
+            if self.kiss_eng._loaded:
+                self._log("  ✔ CLIP already loaded — reusing.\n", "match")
             else:
-                self._log("  ✔ CLIP ready — text features cached.\n", "match")
+                self._set_status("Loading CLIP from local cache…")
+                self._log("\n  ── Kissing Detection (CLIP) ──", "heading")
+
+                # Check local cache before attempting load
+                model_cached = False
+                try:
+                    from huggingface_hub import try_to_load_from_cache
+                    cf = try_to_load_from_cache(
+                        "openai/clip-vit-base-patch32", "model.safetensors")
+                    if cf is None:
+                        cf = try_to_load_from_cache(
+                            "openai/clip-vit-base-patch32", "pytorch_model.bin")
+                    model_cached = cf is not None
+                except Exception:
+                    model_cached = False
+
+                if not model_cached:
+                    self._log("  ✘ CLIP model not downloaded yet.", "error")
+                    self._log("  → Click '⬇ Download CLIP Model Now' first.", "error")
+                    do_kissing = False
+                else:
+                    self._log("  Loading from local cache (no download)…", "info")
+                    loaded = self.kiss_eng.load(log_fn=self._log)
+                    if not loaded:
+                        self._log("  ✘ CLIP load failed — skipping kissing detection.", "error")
+                        if not self.kiss_eng.available:
+                            self._log("  → Run: pip install --upgrade transformers torch", "error")
+                        do_kissing = False
+                    else:
+                        self._log("  ✔ CLIP ready.\n", "match")
 
         # ── Pre-run kissing detection in batches BEFORE main loop ──
         # This is far faster than running per-image inline
